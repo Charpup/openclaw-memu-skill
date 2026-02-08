@@ -127,6 +127,9 @@ class MemUOpenClawService:
         Note: MemU API signature is memorize(resource_url, modality, user).
         For text content, we use resource_url with text:// protocol.
         """
+        if not content:
+            raise ValueError("content cannot be empty")
+        
         if not self._initialized:
             self.initialize()
         

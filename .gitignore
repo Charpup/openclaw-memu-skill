@@ -47,8 +47,10 @@ Thumbs.db
 logs/
 
 # Test outputs
-test_*.py
 TEST_REPORT.md
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Data (may contain sensitive info)
 data/

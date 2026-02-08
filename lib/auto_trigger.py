@@ -18,7 +18,7 @@ TRIGGER_PATTERNS = {
         r"我不喜欢\s*(.+?)[。，!！]",
     ],
     "health": [
-        r"我有\s*(.+?)(?:病|症|问题)",
+        r"我有\s*(.+?)(?:病|症|问题)?[，。！,]",
         r"我(?:对|有)\s*(.+?)过敏",
         r"我患有\s*(.+?)[。，]",
         r"我正在服用\s*(.+?)[。，]",
@@ -55,7 +55,7 @@ def detect_triggers(message: str) -> List[Tuple[str, str]]:
                 else:
                     content = match.strip()
                 
-                if content and len(content) > 3:  # 过滤短内容
+                if content and len(content) >= 2:  # 过滤过短内容
                     triggers.append((category, content))
     
     return triggers

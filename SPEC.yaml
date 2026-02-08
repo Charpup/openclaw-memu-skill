@@ -1,0 +1,406 @@
+# MemU Skill SDD Specification
+# TDD+SDD 双金字塔流程验证项目
+
+spec_version: "1.0"
+module_name: "openclaw_memu_skill"
+description: "OpenClaw 长期记忆集成 Skill - 基于 MemU 框架的直接 PostgreSQL 连接方案"
+version: "1.0.0"
+author: "Galatea"
+date: "2026-02-08"
+
+# 项目背景
+context:
+  purpose: "为 OpenClaw AI Agent 提供长期记忆能力"
+  problem: "Session 级别记忆无法跨会话持久化"
+  solution: "集成 MemU 框架，直接连接 PostgreSQL，无需 MemU Server"
+  target_users: "OpenClaw AI Agent 开发者"
+
+# 架构设计
+architecture:
+  type: " layered"
+  layers:
+    - name: "OpenClaw Agent"
+      role: "调用方"
+      interface: "stdin/stdout (CLI tools)"
+    
+    - name: "MemU Skill"
+      role: "集成层"
+      components:
+        - "lib/memu_service.py - MemoryService 包装器"
+        - "lib/auto_trigger.py - 自动触发检测"
+        - "tools/memorize.py - 记忆存储 CLI"
+        - "tools/retrieve.py - 记忆检索 CLI"
+    
+    - name: "MemU Library"
+      role: "核心框架"
+      interface: "memu.app.service.MemoryService"
+    
+    - name: "PostgreSQL"
+      role: "持久化存储"
+      extension: "pgvector"
+    
+    - name: "LLM API"
+      role: "Embedding 服务"
+      provider: "API 易 / OpenRouter"
+
+# 接口定义
+interfaces:
+  - name: "MemUOpenClawService"
+    type: "class"
+    description: "MemoryService 单例包装器，提供缓存和配置管理"
+    
+    methods:
+      - name: "initialize"
+        signature: "(openrouter_key: Optional[str], postgres_dsn: Optional[str]) -> None"
+        description: "初始化 MemoryService，验证环境变量配置"
+        
+        contract:
+          preconditions:
+            - "APIYI_API_KEY 环境变量必须设置"
+            - "OPENROUTER_API_KEY 环境变量必须设置"
+          postconditions:
+            - "MemoryService 实例创建成功"
+            - "数据库连接可访问"
+            - "_initialized = True"
+        
+        exceptions:
+          - type: "ValueError"
+            condition: "缺少必需的环境变量"
+        
+        quality_attributes:
+          - name: "init_latency"
+            threshold: "< 1000ms"
+
+      - name: "memorize"
+        signature: "(content: str, user_id: str = 'default') -> Dict[str, Any]"
+        description: "存储记忆到长期记忆系统"
+        
+        contract:
+          preconditions:
+            - "content 不为空"
+            - "service 已初始化"
+          postconditions:
+            - "记忆写入 PostgreSQL"
+            - "返回包含 memory_id 的结果"
+        
+        side_effects:
+          - "数据持久化到数据库"
+          - "向量索引更新"
+        
+        test_cases:
+          - id: "MEM-001"
+            name: "正常存储记忆"
+            input:
+              content: "Master 喜欢暗色模式"
+              user_id: "master"
+            expected:
+              success: true
+              has_memory_id: true
+              
+          - id: "MEM-002"
+            name: "空内容处理"
+            input:
+              content: ""
+              user_id: "master"
+            expected:
+              exception: "ValueError"
+              message: "content cannot be empty"
+              
+          - id: "MEM-003"
+            name: "特殊字符内容"
+            input:
+              content: "记住：API key = sk-xxx-xxx"
+              user_id: "master"
+            expected:
+              success: true
+              content_preserved: true
+
+      - name: "retrieve"
+        signature: "(query: str, user_id: str = 'default', limit: int = 5) -> List[Dict[str, Any]]"
+        description: "检索相关记忆，支持缓存"
+        
+        contract:
+          preconditions:
+            - "query 不为空"
+            - "service 已初始化"
+          postconditions:
+            - "返回相关记忆列表"
+            - "返回数量 <= limit"
+        
+        caching:
+          enabled: true
+          ttl: 300  # 5 minutes
+          key_pattern: "{user_id}:{query}"
+        
+        test_cases:
+          - id: "RET-001"
+            name: "正常检索"
+            input:
+              query: "界面偏好"
+              user_id: "master"
+              limit: 5
+            expected:
+              result_count: ">= 0"
+              result_count: "<= 5"
+              has_relevance_score: true
+              
+          - id: "RET-002"
+            name: "缓存命中"
+            input:
+              query: "相同的查询"
+              user_id: "master"
+            preconditions:
+              - "5分钟内执行过相同查询"
+            expected:
+              cache_hit: true
+              response_time: "< 10ms"
+              
+          - id: "RET-003"
+            name: "无匹配结果"
+            input:
+              query: "不存在的xyzabc123"
+              user_id: "master"
+            expected:
+              result_count: 0
+              return_type: "list"
+
+  - name: "auto_trigger detection"
+    type: "function"
+    description: "自动检测需要存储的关键信息"
+    
+    methods:
+      - name: "detect_triggers"
+        signature: "(message: str) -> List[Tuple[str, str]]"
+        description: "检测消息中的记忆触发词"
+        
+        trigger_patterns:
+          - category: "preference"
+            patterns: ["我喜欢(.+?)[。，!！]", "我讨厌(.+?)[。，!！]"]
+          - category: "health"
+            patterns: ["我有(.+?)(?:病|症|问题)", "我对(.+?)过敏"]
+          - category: "personal"
+            patterns: ["我的(.+?)是(.+?)[。，!！]"]
+          - category: "explicit"
+            patterns: ['记住[这|那]个[：:]?\\s*(.+)', '请记住[：:]?\\s*(.+)']
+        
+        test_cases:
+          - id: "TRIG-001"
+            name: "偏好触发检测"
+            input:
+              message: "我喜欢简洁的回复风格"
+            expected:
+              triggered: true
+              category: "preference"
+              extracted: "简洁的回复风格"
+              
+          - id: "TRIG-002"
+            name: "健康触发检测"
+            input:
+              message: "我有前庭性偏头痛"
+            expected:
+              triggered: true
+              category: "health"
+              extracted: "前庭性偏头痛"
+              
+          - id: "TRIG-003"
+            name: "显式触发检测"
+            input:
+              message: "记住这个：明天检查 gateway"
+            expected:
+              triggered: true
+              category: "explicit"
+              extracted: "明天检查 gateway"
+              
+          - id: "TRIG-004"
+            name: "无触发"
+            input:
+              message: "今天天气不错"
+            expected:
+              triggered: false
+
+# 行为场景 (BDD Style)
+scenarios:
+  - id: "E2E-001"
+    name: "完整记忆工作流"
+    priority: high
+    
+    given:
+      - condition: "PostgreSQL 运行中"
+      - condition: "环境变量已配置"
+      - condition: "用户 'master' 存在"
+      
+    when:
+      - action: "调用 memorize('我喜欢暗色模式', 'master')"
+      - action: "调用 retrieve('界面偏好', 'master')"
+      
+    then:
+      - expectation: "memorize 返回成功"
+      - expectation: "retrieve 返回包含 '暗色模式' 的结果"
+      - expectation: "相关性分数 > 0.7"
+      
+    quality_attributes:
+      - name: "end_to_end_latency"
+        threshold: "< 3000ms"  # 包含 embedding API 调用
+
+  - id: "E2E-002"
+    name: "自动触发完整流程"
+    priority: high
+    
+    given:
+      - condition: "auto_trigger 模块已加载"
+      
+    when:
+      - action: "用户输入 '我有偏头痛，需要休息'"
+      - action: "调用 detect_triggers()"
+      - action: "如果触发，调用 memorize()"
+      
+    then:
+      - expectation: "检测到 health 类别触发"
+      - expectation: "内容自动存储到 MemU"
+      - expectation: "分类为 #health"
+
+  - id: "E2E-003"
+    name: "缓存机制验证"
+    priority: medium
+    
+    given:
+      - condition: "已执行过一次 retrieve 查询"
+      - condition: "在 5 分钟内"
+      
+    when:
+      - action: "再次执行相同 retrieve 查询"
+      
+    then:
+      - expectation: "返回缓存结果"
+      - expectation: "响应时间 < 10ms"
+      - expectation: "无数据库查询"
+
+# 非功能需求
+non_functional:
+  performance:
+    - metric: "memorize_latency"
+      threshold: "< 2000ms (p95)"
+      notes: "包含 embedding API 调用"
+      
+    - metric: "retrieve_cache_hit_latency"
+      threshold: "< 10ms"
+      
+    - metric: "retrieve_cache_miss_latency"
+      threshold: "< 500ms"
+
+  reliability:
+    - requirement: "数据库连接失败时抛出明确异常"
+    - requirement: "API key 无效时给出清晰错误信息"
+    - requirement: "缓存失效不影响功能"
+
+  maintainability:
+    - requirement: "代码覆盖率 >= 80%"
+    - requirement: "所有公共方法有 docstring"
+    - requirement: "符合 PEP8 规范"
+
+# 验收标准
+acceptance_criteria:
+  functional:
+    - "所有单元测试通过"
+    - "集成测试通过 (PostgreSQL 连接)"
+    - "验收测试通过 (端到端)"
+    - "代码覆盖率 >= 80%"
+    
+  quality:
+    - "pylint 评分 >= 8.0"
+    - "black 格式化通过"
+    - "无安全漏洞 (bandit)"
+    
+  documentation:
+    - "README.md 完整"
+    - "SKILL.md 更新"
+    - "代码注释覆盖率 >= 50%"
+
+# 配置
+config:
+  environment_variables:
+    required:
+      - name: "APIYI_API_KEY"
+        description: "API 易 Embedding API Key"
+        example: "sk-..."
+      - name: "OPENROUTER_API_KEY"
+        description: "OpenRouter LLM API Key"
+        example: "sk-or-..."
+    optional:
+      - name: "MEMU_POSTGRES_DSN"
+        description: "PostgreSQL 连接字符串"
+        default: "postgresql://memu:memu_secure_password@localhost:5432/memu_db"
+        
+  cache:
+    enabled: true
+    ttl: 300  # seconds
+    max_size: 100  # entries
+    cleanup_interval: 600  # seconds
+
+# 测试策略
+testing_strategy:
+  unit_tests:
+    focus: "单函数/方法，Mock 外部依赖"
+    coverage_target: 80
+    tools: ["pytest", "pytest-mock", "pytest-asyncio"]
+    
+  integration_tests:
+    focus: "模块间协作，真实 PostgreSQL"
+    services: ["PostgreSQL with pgvector"]
+    setup: "docker run postgres"
+    
+  acceptance_tests:
+    focus: "端到端验证，完整工作流"
+    criteria: "符合 SPEC 场景"
+    
+  performance_tests:
+    focus: "响应时间，缓存命中率"
+    benchmarks: ["memorize_latency", "retrieve_latency"]
+
+# 依赖
+dependencies:
+  runtime:
+    - package: "memu-py"
+      version: ">=1.4.0"
+    - package: "psycopg2-binary"
+      version: ">=2.9.0"
+    - package: "PyYAML"
+      version: ">=6.0"
+      
+  development:
+    - package: "pytest"
+      version: ">=7.0"
+    - package: "pytest-cov"
+      version: ">=4.0"
+    - package: "pytest-asyncio"
+      version: ">=0.21"
+    - package: "black"
+      version: ">=23.0"
+    - package: "pylint"
+      version: ">=2.17"
+
+# 风险与缓解
+risks:
+  - risk: "Embedding API 调用成本高"
+    mitigation: "实现缓存机制，减少重复调用"
+    
+  - risk: "PostgreSQL 连接不稳定"
+    mitigation: "添加重试机制和连接池"
+    
+  - risk: "API key 泄露"
+    mitigation: "强制使用环境变量，代码中无硬编码"
+
+# 参考文档
+references:
+  - "SDD+SDD Research Report: ../../research/sdd_tdd_comparison_report.md"
+  - "Quick Reference: ../../research/QUICK_REFERENCE.md"
+  - "MemU GitHub: https://github.com/NevaMind-AI/memU"
+  - "OpenClaw Docs: https://docs.openclaw.ai"
+
+# 修订历史
+changelog:
+  - version: "1.0.0"
+    date: "2026-02-08"
+    changes: 
+      - "Initial SPEC for MemU Skill"
+      - "TDD+SDD 双金字塔流程验证"
